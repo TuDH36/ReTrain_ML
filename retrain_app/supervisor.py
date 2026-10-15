@@ -5,11 +5,18 @@ import signal
 import subprocess
 import sys
 import time
-from urllib.parse import quote
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+CALLBACK_STATUSES = {
+    "TRAIN": "TRAINING",
+    "EVALUATE": "EVALUATING",
+    "PUBLISH": "PACKAGING",
+    "DONE": "SUCCESS",
+    "FAILED": "FAILED",
+}
 
 
 class InstanceLock:
@@ -41,19 +48,34 @@ class Callbacks:
         self.settings, self.store = settings, store
 
     async def deliver(self, client, event):
-        url = self.settings.callback_url.replace("{job_id}", quote(event["job_id"], safe=""))
-        headers = {"X-Event-Seq": str(event["seq"])}
-        if self.settings.callback_token:
-            headers["Authorization"] = f"Bearer {self.settings.callback_token}"
+        if event["status"] == "CANCELLED":
+            # Compatibility with undelivered entries from the older callback contract.
+            # BE confirms cancellation by repeating POST /cancel until HTTP 200 CANCELLED.
+            self.store.callback_result(event["job_id"], event["seq"], True)
+            return
+        if not self.settings.callback_enabled:
+            return
+        body = {
+            "job_id": event["job_id"],
+            "status": CALLBACK_STATUSES[event["status"]],
+            "error_message": None,
+        }
+        if event["status"] == "FAILED":
+            job = self.store.get(event["job_id"])
+            body["error_message"] = job["error_code"] or "RETRAIN_FAILED"
+        headers = {"X-AI-Service-Token": self.settings.callback_token}
+        http_status = None
         try:
-            response = await client.post(url, json={"status": event["status"]}, headers=headers)
-            ok = 200 <= response.status_code < 300
+            response = await client.post(self.settings.callback_url, json=body, headers=headers)
+            http_status = response.status_code
+            ok = http_status == 200
         except httpx.HTTPError:
             ok = False
         delay = min(2 ** min(event["attempts"], 10), self.settings.callback_retry_max_seconds)
         self.store.callback_result(event["job_id"], event["seq"], ok, delay)
         if not ok:
-            log.warning("callback_pending job=%s seq=%s", event["job_id"], event["seq"])
+            # Keep this event pending: a later phase must never overtake a rejected one.
+            log.warning("callback_pending job=%s seq=%s http_status=%s", event["job_id"], event["seq"], http_status)
 
     async def run(self):
         async with httpx.AsyncClient(timeout=self.settings.callback_timeout, follow_redirects=False) as client:

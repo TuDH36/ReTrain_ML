@@ -12,6 +12,7 @@ class Settings:
     api_token: str = ""
     callback_url: str = ""
     callback_token: str = ""
+    callback_enabled: bool = False
     callback_timeout: float = 10
     callback_retry_max_seconds: float = 60
     max_concurrent_jobs: int = 2
@@ -71,15 +72,21 @@ class Settings:
         return cls(**values)
 
     def validate(self):
-        for name in ("api_token", "callback_url", "es_url", "minio_endpoint",
+        for name in ("api_token", "es_url", "minio_endpoint",
                      "minio_access_key", "minio_secret_key"):
             if not getattr(self, name) or getattr(self, name).startswith("CHANGE_ME"):
                 raise ValueError(f"Configure {name.upper()} in .env")
         if len(self.api_token) < 24:
             raise ValueError("API_TOKEN must contain at least 24 characters")
-        if self.callback_url.count("{job_id}") != 1:
-            raise ValueError("CALLBACK_URL must contain exactly one {job_id}")
-        for value in (self.callback_url, self.es_url, self.minio_endpoint):
+        if self.callback_enabled:
+            if not self.callback_url or not self.callback_token or self.callback_token.startswith("CHANGE_ME"):
+                raise ValueError("Configure CALLBACK_URL and CALLBACK_TOKEN before enabling callbacks")
+            if "{" in self.callback_url or "}" in self.callback_url:
+                raise ValueError("CALLBACK_URL must be a fixed URL; job_id is sent in the JSON body")
+        urls = [self.es_url, self.minio_endpoint]
+        if self.callback_enabled:
+            urls.append(self.callback_url)
+        for value in urls:
             parsed = urlparse(value)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("Service URLs must use http:// or https://")

@@ -54,6 +54,8 @@ def create_app(settings=None, *, run_supervisor=True):
 
     @app.post("/api/v1/ai/retrain/start", dependencies=[Depends(auth)])
     def start(body: StartRequest):
+        if not settings.callback_enabled:
+            raise HTTPException(503, "CALLBACK_NOT_ENABLED")
         if not settings.es_mapping_confirmed:
             raise HTTPException(503, "Confirm ES mapping in .env: ES_MAPPING_CONFIRMED=true")
         if len(body.added_alert_ids) + len(body.removed_alert_ids) > settings.max_alerts:

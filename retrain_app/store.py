@@ -116,7 +116,7 @@ class Store:
             if status in {"DONE", "FAILED"}:
                 raise JobError("JOB_NOT_CANCELLABLE")
             if status == "QUEUED":
-                self._set(db, job_id, "CANCELLED")
+                self._set(db, job_id, "CANCELLED", emit=False)
             elif status not in {"CANCELLING", "CANCELLED"}:
                 db.execute("UPDATE jobs SET cancel_from=? WHERE job_id=?", (status, job_id))
                 self._set(db, job_id, "CANCELLING", emit=False)
@@ -134,7 +134,7 @@ class Store:
         with self.transaction() as db:
             row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if row[0] == "CANCELLING":
-                self._set(db, job_id, "CANCELLED")
+                self._set(db, job_id, "CANCELLED", emit=False)
 
     def check_cancel(self, job_id):
         if self.get(job_id)["status"] == "CANCELLING":
