@@ -1,0 +1,10 @@
+.env
+.venv
+state
+__pycache__
+**/__pycache__
+.pytest_cache
+tests
+README.md
+requirements-dev.txt
+.git

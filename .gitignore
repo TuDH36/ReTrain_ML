@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.venv/
+state/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+*.sqlite3*
+*.pkl
+*.xlsx
+*.parquet
+*.csv
+*.tar
