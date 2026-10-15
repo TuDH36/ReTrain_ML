@@ -24,7 +24,7 @@ def run(job_id):
     from .contracts import Cancelled, JobError
     from .elasticsearch import Alerts
     from .storage import Models
-    from .store import Store
+    from .store import CANCEL_PENDING, Store
     from .training import fit_bundle, selected_ids
 
     cfg = Settings.from_env()
@@ -38,7 +38,7 @@ def run(job_id):
         if job["status"] == "PUBLISH":
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
         else:
-            if job["status"] == "CANCELLING":
+            if job["status"] in CANCEL_PENDING:
                 raise Cancelled()
             if models.read_manifest(request["tenant_id"], request["target_version"], optional=True) is not None:
                 raise JobError("TARGET_VERSION_ALREADY_EXISTS")
@@ -64,7 +64,7 @@ def run(job_id):
                 time.sleep(5)
         store.transition(job_id, {"PUBLISH"}, "DONE")
     except Cancelled:
-        pass  # Parent must observe actual exit before emitting CANCELLED.
+        pass  # Parent must observe actual exit before committing CANCELLED.
     except Exception as exc:
         code = exc.code if isinstance(exc, JobError) else type(exc).__name__.upper()
         logging.error("job_failed job=%s code=%s", job_id, code)
@@ -89,19 +89,27 @@ def cleanup(job_id):
     request = json.loads(job["request_json"])
     # TRAIN/EVALUATE cannot have written any target objects: no network needed to cancel.
     if job["cancel_from"] == "PUBLISH":
-        models = Models(cfg)
-        while True:
-            try:
-                models.rollback(request["tenant_id"], request["target_version"], job_id)
-                break
-            except Exception as exc:
-                logging.warning("cancel_cleanup_pending job=%s error_type=%s", job_id, type(exc).__name__)
-                time.sleep(5)
-    shutil.rmtree(cfg.state_dir.resolve() / "work" / job_id, ignore_errors=True)
-    # Parent waits for THIS process to exit before committing CANCELLED and its callback.
+        try:
+            Models(cfg).rollback(request["tenant_id"], request["target_version"], job_id)
+        except Exception as exc:
+            logging.warning("cancel_cleanup_failed job=%s error_type=%s", job_id, type(exc).__name__)
+            store.cancel_failed(job_id, "MINIO_DELETE_FAILED")
+            return False  # BE must observe the failure and request another attempt.
+    root = cfg.state_dir.resolve() / "work" / job_id
+    try:
+        if root.exists():
+            shutil.rmtree(root)
+    except OSError as exc:
+        logging.warning("cancel_local_cleanup_failed job=%s error_type=%s", job_id, type(exc).__name__)
+        store.cancel_failed(job_id, "LOCAL_DELETE_FAILED")
+        return False
+    # Parent waits for THIS process to exit before committing CANCELLED (no callback).
+    return True
 
 
 if __name__ == "__main__":
     bind_parent()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cleanup(sys.argv[1]) if "--cleanup" in sys.argv[2:] else run(sys.argv[1])
+    if "--cleanup" in sys.argv[2:]:
+        raise SystemExit(0 if cleanup(sys.argv[1]) else 1)
+    run(sys.argv[1])

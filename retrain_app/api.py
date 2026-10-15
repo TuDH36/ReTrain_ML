@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
-from .contracts import CancelRequest, JobError, StartRequest
+from .contracts import CancelRequest, CancelResponse, JobError, StartRequest
 from .store import Store, TERMINAL
 from .supervisor import Supervisor
 
@@ -50,7 +50,8 @@ def create_app(settings=None, *, run_supervisor=True):
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "pending_callbacks": app.state.store.pending_callback_count()}
+        return {"status": "ok", "callback_enabled": settings.callback_enabled,
+                "pending_callbacks": app.state.store.pending_callback_count()}
 
     @app.post("/api/v1/ai/retrain/start", dependencies=[Depends(auth)])
     def start(body: StartRequest):
@@ -63,9 +64,19 @@ def create_app(settings=None, *, run_supervisor=True):
         row, created = app.state.store.accept(body.model_dump(), settings.max_pending_jobs)
         return JSONResponse(reply(row), status_code=202 if created or row["status"] not in TERMINAL else 200)
 
-    @app.post("/api/v1/ai/retrain/cancel", dependencies=[Depends(auth)])
+    @app.post("/api/v1/ai/retrain/cancel", dependencies=[Depends(auth)],
+              response_model=CancelResponse, response_model_exclude_none=True,
+              responses={202: {"model": CancelResponse, "description": "Cancellation in progress; tenant remains locked."},
+                         503: {"model": CancelResponse, "description": "Cancellation attempt failed; call again after backoff to retry."}},
+              description="Call repeatedly with the same job_id and tenant_id. A failed attempt is reported as "
+                          "503 CANCEL_FAILED once; the following call starts a retry and returns 202 CANCELLING. "
+                          "Only 200 CANCELLED confirms the process stopped and cleanup finished. "
+                          "Cancellation statuses are not sent to the training callback.")
     def cancel(body: CancelRequest):
         row = app.state.store.request_cancel(body.job_id, body.tenant_id)
-        return JSONResponse(reply(row), status_code=200 if row["status"] == "CANCELLED" else 202)
+        result = {key: row[key] for key in ("job_id", "tenant_id", "status")}
+        if row["status"] == "CANCEL_FAILED":
+            result["error_code"] = row["error_code"]
+        return JSONResponse(result, status_code={"CANCELLED": 200, "CANCELLING": 202, "CANCEL_FAILED": 503}[row["status"]])
 
     return app

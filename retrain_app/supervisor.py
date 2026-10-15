@@ -8,6 +8,8 @@ import time
 
 import httpx
 
+from .store import CANCEL_PENDING
+
 log = logging.getLogger(__name__)
 
 CALLBACK_STATUSES = {
@@ -48,7 +50,7 @@ class Callbacks:
         self.settings, self.store = settings, store
 
     async def deliver(self, client, event):
-        if event["status"] == "CANCELLED":
+        if event["status"] in {"CANCELLED", "CANCEL_FAILED"}:
             # Compatibility with undelivered entries from the older callback contract.
             # BE confirms cancellation by repeating POST /cancel until HTTP 200 CANCELLED.
             self.store.callback_result(event["job_id"], event["seq"], True)
@@ -116,7 +118,7 @@ class Supervisor:
         proc = subprocess.Popen(command,
                                 env=env, start_new_session=(os.name != "nt"))
         self.children[job["job_id"]] = {"process": proc, "started": time.monotonic(), "term_at": None,
-                                        "cleanup": cleanup}
+                                        "cleanup": cleanup, "cancel_attempt_at": job.get("cancel_attempt_at")}
 
     @staticmethod
     def signal_child(entry, force=False):
@@ -146,12 +148,22 @@ class Supervisor:
             proc = entry["process"]
             if proc.poll() is not None:
                 proc.wait()
-                if entry["cleanup"] and proc.returncode == 0:
-                    self.store.cancel_cleaned(job_id)
+                if entry["cleanup"]:
+                    if proc.returncode == 0:
+                        self.store.cancel_cleaned(job_id)
+                    elif job["status"] == "CANCELLING" and job["cancel_attempt_at"] == entry.get("cancel_attempt_at"):
+                        self.store.cancel_failed(job_id, "CANCEL_CLEANUP_FAILED")
                 else:
                     self.store.stopped(job_id, "TRAIN_TIMEOUT" if entry.get("timed_out") else "WORKER_PROCESS_EXITED")
                 del self.children[job_id]
                 self.restart_after[job_id] = now + (0 if job["status"] == "CANCELLING" and not entry["cleanup"] else 10)
+                continue
+            if job["status"] == "CANCELLING" and time.time() - job["cancel_attempt_at"] >= self.settings.cancel_attempt_timeout:
+                self.store.cancel_failed(job_id, "CANCEL_TIMEOUT")
+                # Keep tracking the process. Never unlock or start another publisher
+                # while a timed-out process might still be running or writing to S3.
+                continue
+            if job["status"] == "CANCEL_FAILED":
                 continue
             if entry["cleanup"]:
                 continue
@@ -159,11 +171,17 @@ class Supervisor:
             timed_out = now - entry["started"] > self.settings.max_train_seconds and job["status"] != "PUBLISH" and not cooperative_cancel
             if (job["status"] == "CANCELLING" and not cooperative_cancel) or timed_out:
                 entry["timed_out"] = timed_out
-                if entry["term_at"] is None:
-                    self.signal_child(entry)
-                    entry["term_at"] = now
-                elif now - entry["term_at"] > self.settings.cancel_grace_seconds:
-                    self.signal_child(entry, force=True)
+                try:
+                    if entry["term_at"] is None:
+                        self.signal_child(entry)
+                        entry["term_at"] = now
+                    elif now - entry["term_at"] > self.settings.cancel_grace_seconds:
+                        self.signal_child(entry, force=True)
+                except OSError:
+                    if job["status"] in CANCEL_PENDING:
+                        self.store.cancel_failed(job_id, "CANCEL_PROCESS_STOP_FAILED")
+                    else:
+                        log.exception("process_stop_failed job=%s", job_id)
         for job in self.store.active():
             if len(self.children) >= self.settings.max_concurrent_jobs:
                 break
@@ -177,7 +195,10 @@ class Supervisor:
             try:
                 self.spawn(job)
             except OSError:
-                self.store.stopped(job_id, "PROCESS_START_FAILED")
+                if job["status"] == "CANCELLING":
+                    self.store.cancel_failed(job_id, "CANCEL_PROCESS_START_FAILED")
+                else:
+                    self.store.stopped(job_id, "PROCESS_START_FAILED")
                 self.restart_after[job_id] = now + 10
 
     async def close(self):

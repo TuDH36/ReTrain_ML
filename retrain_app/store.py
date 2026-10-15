@@ -8,7 +8,8 @@ from contextlib import contextmanager
 from .contracts import Cancelled, JobError
 
 TERMINAL = {"DONE", "FAILED", "CANCELLED"}
-ACTIVE_SQL = "'QUEUED','TRAIN','EVALUATE','PUBLISH','CANCELLING'"
+CANCEL_PENDING = {"CANCELLING", "CANCEL_FAILED"}
+ACTIVE_SQL = "'QUEUED','TRAIN','EVALUATE','PUBLISH','CANCELLING','CANCEL_FAILED'"
 
 
 class Store:
@@ -35,6 +36,18 @@ class Store:
                     PRIMARY KEY(job_id, seq)
                 );
             """)
+        # Upgrade existing volumes without losing jobs or pending callbacks.
+        with self.transaction() as db:
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
+            if "cancel_failure_reported" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN cancel_failure_reported INTEGER NOT NULL DEFAULT 0")
+            if "cancel_attempt_at" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN cancel_attempt_at REAL")
+                db.execute("UPDATE jobs SET cancel_attempt_at=updated_at WHERE status='CANCELLING'")
+            index = db.execute("SELECT sql FROM sqlite_master WHERE name='one_active_per_tenant'").fetchone()
+            if index and "CANCEL_FAILED" not in index[0]:
+                db.execute("DROP INDEX one_active_per_tenant")
+                db.execute(f"CREATE UNIQUE INDEX one_active_per_tenant ON jobs(tenant_id) WHERE status IN ({ACTIVE_SQL})")
 
     @contextmanager
     def connection(self):
@@ -101,7 +114,7 @@ class Store:
     def transition(self, job_id, expected, status, error_code=None):
         with self.transaction() as db:
             row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-            if row and row[0] == "CANCELLING":
+            if row and row[0] in CANCEL_PENDING:
                 raise Cancelled()
             if not row or row[0] not in expected:
                 raise JobError("INVALID_JOB_TRANSITION")
@@ -117,27 +130,46 @@ class Store:
                 raise JobError("JOB_NOT_CANCELLABLE")
             if status == "QUEUED":
                 self._set(db, job_id, "CANCELLED", emit=False)
-            elif status not in {"CANCELLING", "CANCELLED"}:
-                db.execute("UPDATE jobs SET cancel_from=? WHERE job_id=?", (status, job_id))
+            elif status == "CANCEL_FAILED":
+                if not row["cancel_failure_reported"]:
+                    # Report the failed attempt once before the next call retries it.
+                    # Polling cannot silently clear a failure before BE sees it.
+                    db.execute("UPDATE jobs SET cancel_failure_reported=1 WHERE job_id=?", (job_id,))
+                    return dict(row)
+                db.execute("UPDATE jobs SET cancel_attempt_at=?,cancel_failure_reported=0 WHERE job_id=?",
+                           (time.time(), job_id))
                 self._set(db, job_id, "CANCELLING", emit=False)
-        return self.get(job_id)
+            elif status not in {"CANCELLING", "CANCELLED"}:
+                db.execute("UPDATE jobs SET cancel_from=?,cancel_attempt_at=? WHERE job_id=?",
+                           (status, time.time(), job_id))
+                self._set(db, job_id, "CANCELLING", emit=False)
+            # Return this transaction's result even if the child finishes immediately.
+            return dict(db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
+
+    def cancel_failed(self, job_id, error_code):
+        """A cancellation failure is NOT terminal and never emits a training callback."""
+        with self.transaction() as db:
+            row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row and row[0] == "CANCELLING":
+                db.execute("UPDATE jobs SET cancel_failure_reported=0 WHERE job_id=?", (job_id,))
+                self._set(db, job_id, "CANCEL_FAILED", error_code, emit=False)
 
     def stopped(self, job_id, error_code="WORKER_PROCESS_EXITED"):
         """Only the supervisor calls this, AFTER reaping the subprocess."""
         with self.transaction() as db:
             row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-            if row[0] not in TERMINAL and row[0] not in {"PUBLISH", "CANCELLING"}:
+            if row[0] not in TERMINAL and row[0] not in {"PUBLISH", *CANCEL_PENDING}:
                 self._set(db, job_id, "FAILED", error_code)
 
     def cancel_cleaned(self, job_id):
         """Called only after the cleanup child successfully exited."""
         with self.transaction() as db:
             row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-            if row[0] == "CANCELLING":
+            if row[0] in CANCEL_PENDING:
                 self._set(db, job_id, "CANCELLED", emit=False)
 
     def check_cancel(self, job_id):
-        if self.get(job_id)["status"] == "CANCELLING":
+        if self.get(job_id)["status"] in CANCEL_PENDING:
             raise Cancelled()
 
     def recover(self):
@@ -145,7 +177,8 @@ class Store:
         for job in self.active():
             if job["status"] in {"TRAIN", "EVALUATE", "CANCELLING"}:
                 self.stopped(job["job_id"], "WORKER_RESTARTED")
-        # CANCELLING resumes cleanup. PUBLISH resumes its durable prepared bundle.
+        # CANCELLING resumes cleanup; CANCEL_FAILED waits for BE to retry /cancel.
+        # PUBLISH resumes its durable prepared bundle.
 
     def due_callbacks(self):
         with self.connection() as db:

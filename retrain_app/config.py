@@ -20,6 +20,7 @@ class Settings:
     max_alerts: int = 200000
     train_threads: int = 2
     cancel_grace_seconds: float = 5
+    cancel_attempt_timeout: float = 180
     max_train_seconds: float = 14400
     es_url: str = ""
     es_username: str = ""
@@ -91,7 +92,7 @@ class Settings:
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("Service URLs must use http:// or https://")
         for name in ("max_concurrent_jobs", "max_pending_jobs", "max_alerts", "train_threads",
-                     "cancel_grace_seconds", "max_train_seconds", "es_batch_size",
+                     "cancel_grace_seconds", "cancel_attempt_timeout", "max_train_seconds", "es_batch_size",
                      "callback_timeout", "callback_retry_max_seconds", "io_timeout"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")

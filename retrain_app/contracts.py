@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -55,6 +55,13 @@ class CancelRequest(BaseModel):
     @classmethod
     def tenant(cls, value):
         return value.upper()
+
+
+class CancelResponse(BaseModel):
+    job_id: str
+    tenant_id: str
+    status: Literal["CANCELLING", "CANCEL_FAILED", "CANCELLED"]
+    error_code: str | None = None
 
 
 class JobError(Exception):
