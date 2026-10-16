@@ -39,8 +39,6 @@ class Store:
         # Upgrade existing volumes without losing jobs or pending callbacks.
         with self.transaction() as db:
             columns = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
-            if "cancel_failure_reported" not in columns:
-                db.execute("ALTER TABLE jobs ADD COLUMN cancel_failure_reported INTEGER NOT NULL DEFAULT 0")
             if "cancel_attempt_at" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN cancel_attempt_at REAL")
                 db.execute("UPDATE jobs SET cancel_attempt_at=updated_at WHERE status='CANCELLING'")
@@ -131,13 +129,10 @@ class Store:
             if status == "QUEUED":
                 self._set(db, job_id, "CANCELLED", emit=False)
             elif status == "CANCEL_FAILED":
-                if not row["cancel_failure_reported"]:
-                    # Report the failed attempt once before the next call retries it.
-                    # Polling cannot silently clear a failure before BE sees it.
-                    db.execute("UPDATE jobs SET cancel_failure_reported=1 WHERE job_id=?", (job_id,))
-                    return dict(row)
-                db.execute("UPDATE jobs SET cancel_attempt_at=?,cancel_failure_reported=0 WHERE job_id=?",
-                           (time.time(), job_id))
+                # A new HTTP request retries the failed cancellation immediately.
+                # Keep the attempt identifier distinct even on low-resolution clocks.
+                attempt = max(time.time(), (row["cancel_attempt_at"] or 0) + 0.000001)
+                db.execute("UPDATE jobs SET cancel_attempt_at=? WHERE job_id=?", (attempt, job_id))
                 self._set(db, job_id, "CANCELLING", emit=False)
             elif status not in {"CANCELLING", "CANCELLED"}:
                 db.execute("UPDATE jobs SET cancel_from=?,cancel_attempt_at=? WHERE job_id=?",
@@ -146,12 +141,11 @@ class Store:
             # Return this transaction's result even if the child finishes immediately.
             return dict(db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
 
-    def cancel_failed(self, job_id, error_code):
+    def cancel_failed(self, job_id, error_code, expected_attempt=None):
         """A cancellation failure is NOT terminal and never emits a training callback."""
         with self.transaction() as db:
-            row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-            if row and row[0] == "CANCELLING":
-                db.execute("UPDATE jobs SET cancel_failure_reported=0 WHERE job_id=?", (job_id,))
+            row = db.execute("SELECT status,cancel_attempt_at FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row and row[0] == "CANCELLING" and (expected_attempt is None or row[1] == expected_attempt):
                 self._set(db, job_id, "CANCEL_FAILED", error_code, emit=False)
 
     def stopped(self, job_id, error_code="WORKER_PROCESS_EXITED"):

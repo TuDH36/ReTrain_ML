@@ -93,15 +93,15 @@ def cleanup(job_id):
             Models(cfg).rollback(request["tenant_id"], request["target_version"], job_id)
         except Exception as exc:
             logging.warning("cancel_cleanup_failed job=%s error_type=%s", job_id, type(exc).__name__)
-            store.cancel_failed(job_id, "MINIO_DELETE_FAILED")
-            return False  # BE must observe the failure and request another attempt.
+            store.cancel_failed(job_id, "MINIO_DELETE_FAILED", job["cancel_attempt_at"])
+            return False  # The waiting HTTP request reports this failure to BE.
     root = cfg.state_dir.resolve() / "work" / job_id
     try:
         if root.exists():
             shutil.rmtree(root)
     except OSError as exc:
         logging.warning("cancel_local_cleanup_failed job=%s error_type=%s", job_id, type(exc).__name__)
-        store.cancel_failed(job_id, "LOCAL_DELETE_FAILED")
+        store.cancel_failed(job_id, "LOCAL_DELETE_FAILED", job["cancel_attempt_at"])
         return False
     # Parent waits for THIS process to exit before committing CANCELLED (no callback).
     return True

@@ -1,3 +1,4 @@
+import logging
 import secrets
 from contextlib import asynccontextmanager
 
@@ -6,6 +7,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
+from .cancellation import Cancellations
 from .contracts import CancelRequest, CancelResponse, JobError, StartRequest
 from .store import Store, TERMINAL
 from .supervisor import Supervisor
@@ -18,12 +20,14 @@ def create_app(settings=None, *, run_supervisor=True):
     async def lifespan(app):
         settings.validate()
         app.state.store = Store(settings.db_path)
+        app.state.cancellations = Cancellations(settings, app.state.store)
         supervisor = Supervisor(settings, app.state.store)
         if run_supervisor:
             supervisor.start()
         try:
             yield
         finally:
+            await app.state.cancellations.close()
             if run_supervisor:
                 await supervisor.close()
 
@@ -66,17 +70,29 @@ def create_app(settings=None, *, run_supervisor=True):
 
     @app.post("/api/v1/ai/retrain/cancel", dependencies=[Depends(auth)],
               response_model=CancelResponse, response_model_exclude_none=True,
-              responses={202: {"model": CancelResponse, "description": "Cancellation in progress; tenant remains locked."},
-                         503: {"model": CancelResponse, "description": "Cancellation attempt failed; call again after backoff to retry."}},
-              description="Call repeatedly with the same job_id and tenant_id. A failed attempt is reported as "
-                          "503 CANCEL_FAILED once; the following call starts a retry and returns 202 CANCELLING. "
-                          "Only 200 CANCELLED confirms the process stopped and cleanup finished. "
-                          "Cancellation statuses are not sent to the training callback.")
-    def cancel(body: CancelRequest):
-        row = app.state.store.request_cancel(body.job_id, body.tenant_id)
+              responses={404: {"model": CancelResponse, "description": "CANCEL_FAILED: job not found for this tenant."},
+                         409: {"model": CancelResponse, "description": "CANCEL_FAILED: job can no longer be cancelled."},
+                         500: {"model": CancelResponse, "description": "CANCEL_FAILED: internal cancellation error."},
+                         503: {"model": CancelResponse, "description": "CANCEL_FAILED: stop/cleanup failed or cancellation timed out."}},
+              description="Waits in this HTTP request until cancellation succeeds or fails; never returns 202 or CANCELLING. "
+                          "Returns 200 CANCELLED only after the process has exited and cleanup is confirmed. "
+                          "CANCEL_FAILED always includes error_code. Calling again after a failed attempt retries cancellation; "
+                          "simultaneous calls join the same attempt. Configure the BE/proxy timeout above "
+                          "CANCEL_ATTEMPT_TIMEOUT (default 180 seconds). No cancellation callback is sent.")
+    async def cancel(body: CancelRequest):
+        try:
+            row = await app.state.cancellations.cancel(body.job_id, body.tenant_id)
+        except JobError as exc:
+            result = {"job_id": body.job_id, "tenant_id": body.tenant_id,
+                      "status": "CANCEL_FAILED", "error_code": exc.code}
+            return JSONResponse(result, status_code=404 if exc.code == "JOB_NOT_FOUND" else 409)
+        except Exception as exc:
+            logging.error("cancel_request_failed job=%s error_type=%s", body.job_id, type(exc).__name__)
+            return JSONResponse({"job_id": body.job_id, "tenant_id": body.tenant_id,
+                                 "status": "CANCEL_FAILED", "error_code": "CANCEL_INTERNAL_ERROR"}, status_code=500)
         result = {key: row[key] for key in ("job_id", "tenant_id", "status")}
         if row["status"] == "CANCEL_FAILED":
             result["error_code"] = row["error_code"]
-        return JSONResponse(result, status_code={"CANCELLED": 200, "CANCELLING": 202, "CANCEL_FAILED": 503}[row["status"]])
+        return JSONResponse(result, status_code=200 if row["status"] == "CANCELLED" else 503)
 
     return app

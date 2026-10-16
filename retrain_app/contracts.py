@@ -60,7 +60,7 @@ class CancelRequest(BaseModel):
 class CancelResponse(BaseModel):
     job_id: str
     tenant_id: str
-    status: Literal["CANCELLING", "CANCEL_FAILED", "CANCELLED"]
+    status: Literal["CANCEL_FAILED", "CANCELLED"]
     error_code: str | None = None
 
 
