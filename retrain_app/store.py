@@ -97,8 +97,13 @@ class Store:
                     (job_id,tenant_id,target_version,request_json,request_hash,status,created_at,updated_at)
                     VALUES (?,?,?,?,?,'QUEUED',?,?)""",
                     (request["job_id"], request["tenant_id"], request["target_version"], body, digest, now, now))
-            except sqlite3.IntegrityError:
-                raise JobError("TENANT_BUSY_OR_TARGET_VERSION_RESERVED") from None
+            except sqlite3.IntegrityError as exc:
+                # Job FAILED van giu UNIQUE(tenant, target_version). Trung phien ban
+                # thi SOAR tang minor. Tenant dang chay la loi khac, khong tang version.
+                message = str(exc)
+                if "target_version" in message:
+                    raise JobError("TARGET_VERSION_RESERVED") from None
+                raise JobError("TENANT_BUSY") from None
         return self.get(request["job_id"]), True
 
     def _set(self, db, job_id, status, error_code=None, emit=True):
