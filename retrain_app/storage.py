@@ -5,6 +5,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from .contracts import JobError
+from .labels import validate_training_labels
 
 ARTIFACTS = {"cat_encoder.pkl", "tfidf_char.pkl", "tfidf_word.pkl", "lgbm_clf.pkl"}
 
@@ -58,6 +59,7 @@ class Models:
         ids = manifest.get("training_alert_ids")
         if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
             raise JobError("BASE_TRAINING_IDS_MISSING_OR_INVALID")
+        validate_training_labels(manifest)
         entries = manifest.get("artifacts", [])
         if not isinstance(entries, list) or len(entries) != 4 or {e.get("file") for e in entries} != ARTIFACTS:
             raise JobError("BASE_ARTIFACTS_INVALID")

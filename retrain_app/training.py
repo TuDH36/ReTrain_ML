@@ -14,6 +14,7 @@ from sklearn.base import clone
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from .contracts import JobError
+from .labels import LABEL_POLICY
 from .field_mapping import FieldMapper, flatten_json
 from .preprocessing import _to_str, clean_value, is_meaningful
 from .storage import ARTIFACTS, file_info
@@ -149,18 +150,22 @@ def fit_bundle(settings, request, base_manifest, base_dir, output_dir, rows, on_
         "base_version": request["base_version"], "job_id": request["job_id"],
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "created_by": request["created_by"], "training_alert_ids": ids,
+        "training_alert_labels": {alert_id: int(label) for alert_id, label in zip(ids, y)},
         "added_count": len(actual_ids - inherited), "removed_count": len(inherited - actual_ids),
         "sklearn_version": sklearn.__version__, "lightgbm_version": lightgbm.__version__,
         "_n_cat_cols": len(cat_cols), "artifacts": [file_info(output_dir / name) for name in sorted(ARTIFACTS)],
         "evaluation": {"dataset": "train", "is_independent_test": False, "sample_count": len(ids),
                        "positive_label": 1, "metrics_by_threshold": scores},
         "training": {"method": "full_refit", "validation": "none", "early_stopping": False,
+                     "label_policy": LABEL_POLICY,
                      "n_estimators": classifier.get_params()["n_estimators"],
                      "conflict_policy": "drop_all_exact_groups_before_noise_cleaning", **counts,
                      "requested_added_count": len(request["added_alert_ids"]),
                      "requested_removed_count": len(request["removed_alert_ids"])},
         "data_source": {"alert_index": settings.es_alert_index, "event_index": settings.es_event_index,
                         "tenant_field": settings.es_tenant_field, "label_field": settings.es_label_field,
+                        "added_label_field": settings.es_added_label_field,
+                        "inherited_label_source": "base_manifest.training_alert_labels_or_legacy_label_field",
                         "event_link_source": settings.es_event_link_source,
                         "event_link_field": settings.es_event_link_field,
                         "event_data_field": settings.es_event_data_field,

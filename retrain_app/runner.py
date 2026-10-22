@@ -46,7 +46,8 @@ def run(job_id):
             models.validate_base(base)
             ids = selected_ids(base["training_alert_ids"], request, cfg.max_alerts)
             models.download_base(request["tenant_id"], request["base_version"], base, root / "base")
-            rows = Alerts(cfg).load(request["tenant_id"], ids)
+            rows = Alerts(cfg).load(request["tenant_id"], ids, base_manifest=base,
+                                    added_alert_ids=request["added_alert_ids"])
             manifest = fit_bundle(cfg, request, base, root / "base", output, rows,
                                   lambda: store.transition(job_id, {"TRAIN"}, "EVALUATE"))
             # Cancellation is checked on this transition and throughout publication.

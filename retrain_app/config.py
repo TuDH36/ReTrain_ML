@@ -31,6 +31,8 @@ class Settings:
     es_alert_index: str = "soar_alerts"
     es_event_index: str = "case_events"
     es_tenant_field: str = "customerCode"
+    es_added_label_field: str = "aiLabel"
+    # Ground truth fallback for inherited versions created before label snapshots.
     es_label_field: str = "rawData.ai_training.label"
     es_positive_label: str = "TRUE_POSITIVE"
     es_negative_label: str = "FALSE_POSITIVE"

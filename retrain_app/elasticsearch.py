@@ -5,6 +5,7 @@ from urllib.parse import quote
 import requests
 
 from .contracts import JobError
+from .labels import TrainingLabels
 from .preprocessing import is_meaningful
 
 
@@ -91,8 +92,9 @@ class Alerts:
                     pass
         return result
 
-    def load(self, tenant, ids):
+    def load(self, tenant, ids, *, base_manifest, added_alert_ids):
         cfg = self.settings
+        labels = TrainingLabels(cfg, base_manifest, added_alert_ids)
         rows = []
         all_refs = set()
         for offset in range(0, len(ids), cfg.es_batch_size):
@@ -109,15 +111,13 @@ class Alerts:
                 source = hit["_source"]
                 if str(field(source, cfg.es_tenant_field) or "").upper() != tenant:
                     raise JobError("ES_ALERT_TENANT_MISMATCH")
-                label = field(source, cfg.es_label_field)
-                label_map = {cfg.es_positive_label: 1, cfg.es_negative_label: 0}
-                if not isinstance(label, str) or label not in label_map:
-                    raise JobError("ES_TRAINING_LABEL_INVALID")
+                label = labels.resolve(hit["_id"], field(source, cfg.es_added_label_field),
+                                       field(source, cfg.es_label_field))
                 ref = hit["_id"] if cfg.es_event_link_source == "_id" else field(source, cfg.es_event_link_source)
                 if not isinstance(ref, str) or not ref or ref in all_refs:
                     raise JobError("ES_EVENT_REFERENCE_MISSING_OR_NONUNIQUE")
                 all_refs.add(ref)
-                by_ref[ref] = (hit["_id"], label_map[label])
+                by_ref[ref] = (hit["_id"], label)
             events = self.events(list(by_ref))
             for ref, (alert_id, label) in by_ref.items():
                 if not events.get(ref):
