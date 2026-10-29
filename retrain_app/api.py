@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings
 from .cancellation import Cancellations
 from .contracts import CancelRequest, CancelResponse, JobError, StartRequest
+from .errors import training_error
 from .store import Store, TERMINAL
 from .supervisor import Supervisor
 
@@ -40,7 +41,9 @@ def create_app(settings=None, *, run_supervisor=True):
 
     def reply(row):
         body = {key: row[key] for key in ("job_id", "tenant_id", "target_version", "status")}
-        if row["error_code"]:
+        if row["status"] == "FAILED":
+            body.update(training_error(row["error_code"]))
+        elif row["error_code"]:
             body["error_code"] = row["error_code"]
         body["manifest_key"] = f"tenants/{row['tenant_id']}/versions/{row['target_version']}/manifest.json"
         return body

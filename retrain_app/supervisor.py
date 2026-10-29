@@ -8,6 +8,7 @@ import time
 
 import httpx
 
+from .errors import training_error
 from .store import CANCEL_PENDING
 
 log = logging.getLogger(__name__)
@@ -64,7 +65,12 @@ class Callbacks:
         }
         if event["status"] == "FAILED":
             job = self.store.get(event["job_id"])
-            body["error_message"] = job["error_code"] or "RETRAIN_FAILED"
+            error = training_error(job["error_code"])
+            # Keep SOAR's three-field callback contract. This field contains one
+            # of four public codes; BE maps it to the user-facing explanation.
+            body["error_message"] = error["error_code"]
+            log.warning("training_failed_callback job=%s error_code=%s reason=%s",
+                        event["job_id"], error["error_code"], job["error_code"])
         headers = {"X-AI-Service-Token": self.settings.callback_token}
         http_status = None
         try:
